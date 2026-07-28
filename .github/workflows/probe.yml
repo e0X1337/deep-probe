@@ -1,0 +1,58 @@
+name: Probe
+on: push
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Service URLs
+        run: |
+          echo "CACHE_URL=$ACTIONS_CACHE_URL"
+          echo "RUNTIME_URL=$ACTIONS_RUNTIME_URL"
+          echo "RESULTS_URL=${ACTIONS_RESULTS_URL:-unset}"
+          echo "RUN_ID=$GITHUB_RUN_ID"
+
+      - name: JWT Claims
+        run: |
+          echo "$ACTIONS_RUNTIME_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "not JWT or decode failed"
+
+      - name: Cache List
+        run: |
+          curl -sf -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -H "Accept: application/json;api-version=6.0-preview.1" "${ACTIONS_CACHE_URL}_apis/artifactcache/caches" | python3 -m json.tool || echo "cache list failed"
+
+      - name: Cross-run artifact access
+        run: |
+          CURRENT=$GITHUB_RUN_ID
+          for OFFSET in 1 2 10 100 1000; do
+            TARGET=$((CURRENT - OFFSET))
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${TARGET}/artifacts?api-version=6.0-preview")
+            echo "Run $TARGET: HTTP $CODE"
+          done
+
+      - name: Runtime API discovery
+        run: |
+          for EP in "" "_apis/pipelines" "_apis/connectionData" "_apis/ResourceAreas" "_apis/pipelines/1/runs"; do
+            RESP=$(curl -s -w "|%{http_code}" -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" "${ACTIONS_RUNTIME_URL}${EP}")
+            CODE=$(echo "$RESP" | rev | cut -d'|' -f1 | rev)
+            echo "GET ...${EP:-/} -> HTTP $CODE"
+          done
+
+      - name: Metadata services
+        run: |
+          curl -sf --connect-timeout 2 http://169.254.169.254/latest/meta-data/ 2>&1 && echo "AWS METADATA ACCESSIBLE" || echo "AWS: blocked"
+          curl -sf --connect-timeout 2 -H "Metadata-Flavor: Google" http://metadata.google.internal/ 2>&1 && echo "GCP METADATA ACCESSIBLE" || echo "GCP: blocked"
+          curl -sf --connect-timeout 2 -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 && echo "AZURE METADATA ACCESSIBLE" || echo "Azure: blocked"
+
+      - name: OIDC token claims
+        run: |
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            TOKEN=$(curl -sf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+            echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+          else
+            echo "OIDC not available"
+          fi
